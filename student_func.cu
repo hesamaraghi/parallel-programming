@@ -273,7 +273,7 @@ logLumMax = 1.f;
 
 int ii = 0;
 
-for (size_t i = 1; i < numCols * numRows; i=i++) {
+for (size_t i = 0; i < numCols * numRows; i=i++) {
     ii = (h_logLuminance[i]<logLumMin) ? i : ii;
     logLumMin = std::min(h_logLuminance[i], logLumMin);
     logLumMax = std::max(h_logLuminance[i], logLumMax);
@@ -286,6 +286,10 @@ printf("cpu max:%f gpu max:%f\n",logLumMax,max_logLum);
 
 checkCudaErrors(cudaFree(d_out_min));
 checkCudaErrors(cudaFree(d_out_max));
+free(h_logLuminance);
+free(h_cdf);
+
+
   
   //TODO
   /*Here are the steps you need to implement
