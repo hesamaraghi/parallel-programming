@@ -168,7 +168,7 @@ void min_max_finding(float * d_out_min,
     // assumes that size is not greater than maxThreadsPerBlock^2
     // and that size is a multiple of maxThreadsPerBlock
 
-    int blocks = (size >> bitMaxThreadsPerBlock) + 1;
+    int blocks = (size / maxThreadsPerBlock) + ((size % maxThreadsPerBlock == 0) ? 0 : 1);
     int size_ = size;
     float *d_intermediate;
     float *d_intermediate2;
@@ -273,7 +273,7 @@ logLumMax = 1.f;
 
 int ii = 0;
 
-for (size_t i = 0; i < numCols * numRows; i=i++) {
+for (size_t i = 0; i < numCols * numRows; ++i) {
     ii = (h_logLuminance[i]<logLumMin) ? i : ii;
     logLumMin = std::min(h_logLuminance[i], logLumMin);
     logLumMax = std::max(h_logLuminance[i], logLumMax);
