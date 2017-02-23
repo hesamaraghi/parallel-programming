@@ -84,7 +84,12 @@
 #include <thrust/extrema.h>
 // #include "reference_calc.h"
 #define maxThreadsPerBlock  1024
+#define itemsPerThread  16
+#define binsPerThread  8
+#define blockSize_x  64
+#define blockSize_y  maxThreadsPerBlock/blockSize_x
 #define bitMaxThreadsPerBlock 10
+
 
 
 __global__ void shmem_reduce_min_kernel(float * d_out, const float * d_in,const int size)
@@ -160,13 +165,20 @@ __global__ void shmem_reduce_max_kernel(float * d_out, const float * d_in,const 
     }
 }
 
-void min_max_finding(float * d_out_min, 
-                     float * d_out_max, 
+void min_max_finding(float * min_logLum, 
+                     float * max_logLum, 
                      const float* const d_in, 
                      int size)
 {
     // assumes that size is not greater than maxThreadsPerBlock^2
     // and that size is a multiple of maxThreadsPerBlock
+
+float * d_out_min, * d_out_max;
+
+
+checkCudaErrors(cudaMalloc((void **) &d_out_min, sizeof(float)));
+checkCudaErrors(cudaMalloc((void **) &d_out_max, sizeof(float)));
+
 
     int blocks = (size / maxThreadsPerBlock) + ((size % maxThreadsPerBlock == 0) ? 0 : 1);
     int size_ = size;
@@ -237,7 +249,69 @@ void min_max_finding(float * d_out_min,
         checkCudaErrors(cudaFree(d_intermediate2));
       } 
     } 
+
+  checkCudaErrors(cudaMemcpy(min_logLum, d_out_min, sizeof(float), cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaMemcpy(max_logLum, d_out_max, sizeof(float), cudaMemcpyDeviceToHost));
+
+  checkCudaErrors(cudaFree(d_out_min));
+  checkCudaErrors(cudaFree(d_out_max));
 }
+
+__global__ void total_atomic_histo(int *d_bins, const float *d_in, const float min_logLum,
+                                   const float max_logLum, const int numBins, const int size)
+{
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    if(myId >= size) return;
+    unsigned int bin = min(static_cast<unsigned int>(numBins - 1),
+                           static_cast<unsigned int>((d_in[myId] - min_logLum) / (max_logLum - min_logLum) * numBins));
+    atomicAdd(&(d_bins[bin]), 1);
+}
+
+__global__ void reduce_atomic_histo(int *d_bins, const float *d_in, const float min_logLum,
+                                   const float max_logLum, const int numBins, const int size)
+{
+  extern __shared__ int sdataint[];
+  int myIdx_x = threadIdx.x + blockDim.x * blockIdx.x;
+  int myIdx_y = threadIdx.y + blockDim.y * blockIdx.y;
+  int i, tid = threadIdx.x + blockDim.x * threadIdx.y;
+  int bin, s;
+  int itemIdx0 = myIdx_x * itemsPerThread,
+      binIdx0  = myIdx_y * binsPerThread;
+  int localHisto[binsPerThread];
+
+  for(i = 0; i < binsPerThread; i++) localHisto[i] = 0;
+
+  if(itemIdx0 < size)
+  {
+    for(i = 0; itemIdx0 + i < size && i < itemsPerThread; i++)
+    {
+      bin = static_cast<unsigned int>((d_in[itemIdx0 + i] - min_logLum) 
+        / (max_logLum - min_logLum) * numBins);
+      bin = (bin == numBins) ? bin - 1 : bin;
+      if(bin >= binIdx0 && bin < (binIdx0 + binsPerThread))
+      localHisto[bin % binsPerThread] = localHisto[bin % binsPerThread] + 1;
+    }
+  }
+
+
+  for(i = 0; i < binsPerThread; i++)
+  {
+    s = blockDim.x;
+    sdataint[tid] = localHisto[i];
+    __syncthreads();           
+    for (s >>= 1; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s)
+        {
+            sdataint[tid] = sdataint[tid] + sdataint[tid + s];
+        }
+        __syncthreads();        
+    }
+    if(threadIdx.x == 0 && binIdx0 + i < numBins) atomicAdd(&(d_bins[binIdx0 + i]), sdataint[blockDim.x * threadIdx.y]);
+    __syncthreads();
+  }
+}
+
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -248,49 +322,46 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numBins)
 {
 
-float * d_out_min, * d_out_max;
+int size = numRows * numCols;
+
+min_max_finding(&min_logLum, &max_logLum, d_logLuminance, size);
+
+int *d_bins;
+
+checkCudaErrors(cudaMalloc((void **) &d_bins, sizeof(int) * numBins));
+checkCudaErrors(cudaMemset(d_bins, 0, sizeof(int) * numBins));
+
+// totally done by atomic add
+
+int blocks = (size / maxThreadsPerBlock) + ((size % maxThreadsPerBlock == 0) ? 0 : 1);
+
+total_atomic_histo<<<blocks,maxThreadsPerBlock>>>(d_bins, d_logLuminance, min_logLum,
+                   max_logLum, numBins, size);
+
+// first reduce then atomic add
+
+int numBlocks_x = (size / (blockSize_x * itemsPerThread)) + ((size % (blockSize_x * itemsPerThread) == 0) ? 0 : 1);
+int numBlocks_y = (numBins / (blockSize_y * binsPerThread)) + ((numBins % (blockSize_y * binsPerThread) == 0) ? 0 : 1);
+dim3 grid(numBlocks_x, numBlocks_y);
+dim3 block(blockSize_x, blockSize_y);
+
+reduce_atomic_histo<<<grid, block, maxThreadsPerBlock * sizeof(int)>>>(d_bins, d_logLuminance, min_logLum,
+                   max_logLum, numBins, size);
 
 
-checkCudaErrors(cudaMalloc((void **) &d_out_min, sizeof(float)));
-checkCudaErrors(cudaMalloc((void **) &d_out_max, sizeof(float)));
+int histo[numBins];
+int h_cdf[numBins];
+checkCudaErrors(cudaMemcpy(histo,d_bins, sizeof(int) * numBins,cudaMemcpyDeviceToHost));
+
+  h_cdf[0] = 0;
+  for (size_t i = 1; i < numBins; ++i) {
+    h_cdf[i] = h_cdf[i - 1] + histo[i - 1];
+  }
+checkCudaErrors(cudaMemcpy(d_cdf,h_cdf, sizeof(int) * numBins,cudaMemcpyHostToDevice));
+
+checkCudaErrors(cudaFree(d_bins));
 
 
-min_max_finding(d_out_min, d_out_max, d_logLuminance, (int) numCols * numRows);
-
-checkCudaErrors(cudaMemcpy(&min_logLum, d_out_min, sizeof(float), cudaMemcpyDeviceToHost));
-checkCudaErrors(cudaMemcpy(&max_logLum, d_out_max, sizeof(float), cudaMemcpyDeviceToHost));
-
-
-float *h_logLuminance = (float *) malloc(sizeof(float)*numRows*numCols); 
-checkCudaErrors(cudaMemcpy(h_logLuminance, d_logLuminance, numRows*numCols*sizeof(float), cudaMemcpyDeviceToHost));
-
-unsigned int *h_cdf = (unsigned int *) malloc(sizeof(unsigned int)*numBins);
-checkCudaErrors(cudaMemcpy(d_cdf, h_cdf, sizeof(unsigned int) * numBins, cudaMemcpyHostToDevice));
-
-float logLumMin, logLumMax;
-logLumMin = 0.f;
-logLumMax = 1.f;
-
-int ii = 0;
-
-for (size_t i = 0; i < numCols * numRows; ++i) {
-    ii = (h_logLuminance[i]<logLumMin) ? i : ii;
-    logLumMin = std::min(h_logLuminance[i], logLumMin);
-    logLumMax = std::max(h_logLuminance[i], logLumMax);
-}
-printf("h[%d] = %f\n",ii,h_logLuminance[ii]);
-printf("cpu min:%f gpu min:%f\n",logLumMin,min_logLum);
-printf("cpu max:%f gpu max:%f\n",logLumMax,max_logLum);
-// referenceCalculation(h_logLuminance, h_cdf, numRows, numCols, numBins, &logLumMin, &logLumMax);
-
-
-checkCudaErrors(cudaFree(d_out_min));
-checkCudaErrors(cudaFree(d_out_max));
-free(h_logLuminance);
-free(h_cdf);
-
-
-  
   //TODO
   /*Here are the steps you need to implement
     1) find the minimum and maximum value in the input logLuminance channel
